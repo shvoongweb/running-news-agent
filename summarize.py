@@ -9,6 +9,18 @@ import requests
 from config import GEMINI_MODEL, NUM_STORIES, FOCUS_EVENT
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+
+# שמות מודלים חלופיים אם המודל שב-config לא זמין למפתח הזה
+FALLBACK_MODELS = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+]
+
+_RESOLVED_MODEL = None
 
 PROMPT = """אתה עורך חדשות ריצה מקצועי הכותב בעברית לקהל ישראלי של רצים - מחובבים ועד תחרותיים.
 לפניך רשימת ידיעות (JSON) מ-36 השעות האחרונות מאתרי הריצה והאתלטיקה המובילים בעולם ומאתרים ישראליים. חלק מהידיעות כוללות שדה details עם טקסט מורחב - שם נמצאים הזמנים, התוצאות והציטוטים.
@@ -54,12 +66,65 @@ def _clean_json(text):
     return json.loads(text)
 
 
+def _available_models(key):
+    """שמות המודלים שהמפתח הזה יכול להשתמש בהם ל-generateContent."""
+    try:
+        r = requests.get(LIST_URL.format(key=key), timeout=60)
+        r.raise_for_status()
+        names = [
+            m["name"].split("/")[-1]
+            for m in r.json().get("models", [])
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])
+        ]
+        print(f"[gemini] מודלים זמינים למפתח: {', '.join(names) or 'אין'}")
+        return names
+    except requests.RequestException as ex:
+        print(f"[gemini] לא הצלחתי לרשום מודלים: {ex}")
+        return []
+
+
+def _resolve_model(key):
+    """בוחר מודל שעובד: קודם זה שב-config, אחר כך חלופות, ולבסוף מה שהמפתח מציע."""
+    global _RESOLVED_MODEL
+    if _RESOLVED_MODEL:
+        return _RESOLVED_MODEL
+
+    candidates = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
+    available = None
+    for model in candidates:
+        try:
+            r = requests.post(
+                API_URL.format(model=model, key=key),
+                json={"contents": [{"parts": [{"text": "ping"}]}]},
+                timeout=60,
+            )
+        except requests.RequestException as ex:
+            print(f"[gemini] {model}: שגיאת רשת ({ex})")
+            continue
+        if r.status_code == 404:
+            print(f"[gemini] {model}: לא קיים למפתח הזה")
+            if available is None:
+                available = _available_models(key)
+                extra = [m for m in available if "flash" in m and m not in candidates]
+                candidates.extend(extra)
+            continue
+        if r.status_code >= 400:
+            # 429/500 - המודל קיים, רק עמוס. נשתמש בו.
+            print(f"[gemini] {model}: HTTP {r.status_code} - המודל קיים, ממשיך איתו")
+        _RESOLVED_MODEL = model
+        print(f"[gemini] משתמש במודל {model}")
+        return model
+
+    raise RuntimeError("לא נמצא מודל Gemini זמין למפתח הזה")
+
+
 def _ask_gemini(prompt, key):
+    model = _resolve_model(key)
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
     }
-    r = requests.post(API_URL.format(model=GEMINI_MODEL, key=key), json=body, timeout=180)
+    r = requests.post(API_URL.format(model=model, key=key), json=body, timeout=180)
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     return _clean_json(text)
@@ -86,7 +151,7 @@ def summarize(items):
         try:
             data = _ask_gemini(prompt, key)
             break
-        except (requests.RequestException, json.JSONDecodeError, KeyError) as ex:
+        except (requests.RequestException, json.JSONDecodeError, KeyError, RuntimeError) as ex:
             last_err = ex
             print(f"[gemini] ניסיון {attempt}/3 נכשל: {ex}")
             time.sleep(4)
