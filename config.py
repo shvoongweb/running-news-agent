@@ -35,7 +35,7 @@ HOURS_WINDOW = 36
 NUM_STORIES = 5
 
 # דגם Gemini (שכבה חינמית)
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 
 # כותרת המותג
 BRAND_TITLE = "חדשות עולם הריצה"

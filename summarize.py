@@ -11,49 +11,20 @@ from config import GEMINI_MODEL, NUM_STORIES, FOCUS_EVENT
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
 
-# שמות מודלים חלופיים אם המודל שב-config לא זמין למפתח הזה
+# סדר העדפה למודלים (ה-API מחזיר 404/503 כשמודל לא זמין למפתח או עמוס)
 FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3-flash-preview",
     "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-1.5-flash",
 ]
 
 _RESOLVED_MODEL = None
-
-PROMPT = """אתה עורך חדשות ריצה מקצועי הכותב בעברית לקהל ישראלי של רצים - מחובבים ועד תחרותיים.
-לפניך רשימת ידיעות (JSON) מ-36 השעות האחרונות מאתרי הריצה והאתלטיקה המובילים בעולם ומאתרים ישראליים. חלק מהידיעות כוללות שדה details עם טקסט מורחב - שם נמצאים הזמנים, התוצאות והציטוטים.
-
-{focus_line}
-
-צור JSON עם שני חלקים:
-
-1. "feature" - כתבה ראשית על **הסיפור הגדול של היום** בעולם הריצה. בחר את הידיעה החשובה, המסקרנת או המדוברת ביותר (תוצאת מרוץ גדול, שיא, פרישה, מעבר קבוצה, סערה, מחקר או חידוש משמעותי). מלא את כל השדות:
-   - "title_he": כותרת ראשית קולעת (עד 12 מילים)
-   - "lead_he": פסקת פתיחה אחת (2-3 משפטים) שמספרת את העיקר - מי, מה, איפה ולמה זה חשוב
-   - "body_he": 2-3 פסקאות נוספות (מופרדות ב-\\n\\n) עם הפירוט: איך זה קרה, נתונים, ציטוטים אם יש, והקשר רחב
-   - "key_facts_he": מערך של 2-4 מחרוזות - עובדות המפתח בשורה אחת כל אחת (זמן, מקום, פער, שיא, גיל, מרחק). לדוגמה "2:03:41 - השיא האישי החדש" או "פער של 47 שניות על המקום השני". קח את המספרים אך ורק מהידיעות; אם אין נתונים מספריים - מערך ריק []
-   - "why_it_matters_he": משפט או שניים - למה זה מעניין את הרץ הישראלי (הקשר, השלכות, מה צפוי הלאה). אם אין זווית אמיתית - ""
-   - "image_keyword": שאילתת תמונה באנגלית - שם הרץ המרכזי + הקשר (למשל "Jakob Ingebrigtsen runner" או "Berlin Marathon finish")
-   - "source_name", "source_url": המקור העיקרי
-
-2. "stories" - {n} ידיעות קצרות על נושאים אחרים (לא מה שכבר סוקר בכתבה הראשית). גוון בין תחרותי לבין ריצת עם, אימונים, ציוד ומחקר, וכלול ידיעה ישראלית אם יש כזו ברשימה:
-   לכל אחת: "title_he" (כותרת קצרה), "paragraph_he" (פסקה של 3-4 משפטים בניסוח מקורי), "source_name", "source_url"
-
-כללים מחייבים:
-- שמות רצים בעברית מלאה (שם פרטי + משפחה) כשידוע לך; אחרת תעתיק את שם המשפחה. בפעם הראשונה אפשר להוסיף את השם הלועזי בסוגריים.
-- זמנים ומרחקים בפורמט ישראלי: "2:03:41", "10 ק\"מ", "חצי מרתון".
-- אסור להמציא עובדות, שמות, זמנים או פערים שלא מופיעים בידיעות המקור. עדיף לוותר על נתון מלהמציא אותו.
-- ניסוח מקורי לחלוטין - לא תרגום מילולי של המקור.
-- אם ידיעה במקור בעברית - נסח מחדש, אל תעתיק.
-
-החזר JSON תקין בלבד (ללא טקסט נוסף וללא סימוני קוד):
-{{"feature": {{...}}, "stories": [...]}}
-
-הידיעות:
-{items}
-"""
+_BAD_MODELS = set()
 
 
 def _clean_json(text):
@@ -84,14 +55,19 @@ def _available_models(key):
 
 
 def _resolve_model(key):
-    """בוחר מודל שעובד: קודם זה שב-config, אחר כך חלופות, ולבסוף מה שהמפתח מציע."""
+    """בוחר מודל שבאמת עונה: 404 = לא קיים, 5xx = עמוס, שניהם מדלגים הלאה."""
     global _RESOLVED_MODEL
-    if _RESOLVED_MODEL:
+    if _RESOLVED_MODEL and _RESOLVED_MODEL not in _BAD_MODELS:
         return _RESOLVED_MODEL
 
     candidates = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
-    available = None
-    for model in candidates:
+    listed = False
+    i = 0
+    while i < len(candidates):
+        model = candidates[i]
+        i += 1
+        if model in _BAD_MODELS:
+            continue
         try:
             r = requests.post(
                 API_URL.format(model=model, key=key),
@@ -101,21 +77,25 @@ def _resolve_model(key):
         except requests.RequestException as ex:
             print(f"[gemini] {model}: שגיאת רשת ({ex})")
             continue
-        if r.status_code == 404:
-            print(f"[gemini] {model}: לא קיים למפתח הזה")
-            if available is None:
-                available = _available_models(key)
-                extra = [m for m in available if "flash" in m and m not in candidates]
-                candidates.extend(extra)
-            continue
-        if r.status_code >= 400:
-            # 429/500 - המודל קיים, רק עמוס. נשתמש בו.
-            print(f"[gemini] {model}: HTTP {r.status_code} - המודל קיים, ממשיך איתו")
-        _RESOLVED_MODEL = model
-        print(f"[gemini] משתמש במודל {model}")
-        return model
 
-    raise RuntimeError("לא נמצא מודל Gemini זמין למפתח הזה")
+        if r.status_code in (200, 429):
+            _RESOLVED_MODEL = model
+            note = " (מכסה מלאה, ננסה בכל זאת)" if r.status_code == 429 else ""
+            print(f"[gemini] משתמש במודל {model}{note}")
+            return model
+
+        print(f"[gemini] {model}: HTTP {r.status_code} - מדלג")
+        _BAD_MODELS.add(model)
+        if r.status_code == 404 and not listed:
+            listed = True
+            extra = [
+                m for m in _available_models(key)
+                if "flash" in m and "image" not in m and "tts" not in m
+                and "transcribe" not in m and m not in candidates
+            ]
+            candidates.extend(extra)
+
+    raise RuntimeError("אף מודל Gemini לא זמין כרגע")
 
 
 def _ask_gemini(prompt, key):
@@ -147,13 +127,17 @@ def summarize(items):
 
     data = None
     last_err = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 6):
         try:
             data = _ask_gemini(prompt, key)
             break
         except (requests.RequestException, json.JSONDecodeError, KeyError, RuntimeError) as ex:
             last_err = ex
-            print(f"[gemini] ניסיון {attempt}/3 נכשל: {ex}")
+            print(f"[gemini] ניסיון {attempt}/5 נכשל: {ex}")
+            status = getattr(getattr(ex, "response", None), "status_code", None)
+            if status and status >= 500 and _RESOLVED_MODEL:
+                _BAD_MODELS.add(_RESOLVED_MODEL)
+                print(f"[gemini] מסמן את {_RESOLVED_MODEL} כעמוס ועובר למודל הבא")
             time.sleep(4)
     if data is None:
         raise last_err
